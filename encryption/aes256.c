@@ -63,16 +63,62 @@ void printArray(uint8_t *data, uint32_t len)
     printf("\n");
 }
 
+static uint32_t pkcs7_pad(uint8_t *data,
+                          uint32_t len,
+                          uint32_t bufferSize)
+{
+    uint32_t padLen = AES_BLOCKLEN - (len % AES_BLOCKLEN);
+
+    if ((len + padLen) > bufferSize)
+    {
+        return 0;
+    }
+
+    memset(data + len, (uint8_t)padLen, padLen);
+    return len + padLen;
+}
+
+static uint32_t pkcs7_unpad(uint8_t *data,
+                            uint32_t len)
+{
+    if ((len == 0) || (len % AES_BLOCKLEN != 0))
+    {
+        return 0;
+    }
+
+    uint8_t padLen = data[len - 1];
+    if ((padLen == 0) || (padLen > AES_BLOCKLEN))
+    {
+        return 0;
+    }
+
+    for (uint32_t i = len - padLen; i < len; i++)
+    {
+        if (data[i] != padLen)
+        {
+            return 0;
+        }
+    }
+
+    return len - padLen;
+}
+
 /* ================= AES ENCRYPT ================= */
 
-void encryptPayload(uint8_t *data,
-                    uint32_t len)
+uint32_t encryptPayload(uint8_t *data,
+                        uint32_t len,
+                        uint32_t bufferSize)
 {
     struct AES_ctx ctx;
-
     uint8_t local_iv[16];
 
     memcpy(local_iv, iv, 16);
+
+    uint32_t paddedLen = pkcs7_pad(data, len, bufferSize);
+    if (paddedLen == 0)
+    {
+        return 0;
+    }
 
     AES_init_ctx_iv(&ctx,
                     aes_key,
@@ -80,16 +126,18 @@ void encryptPayload(uint8_t *data,
 
     AES_CBC_encrypt_buffer(&ctx,
                            data,
-                           len);
+                           paddedLen);
+
+    return paddedLen;
 }
 
 /* ================= AES DECRYPT ================= */
 
-void decryptPayload(uint8_t *data,
-                    uint32_t len)
+uint32_t decryptPayload(uint8_t *data,
+                        uint32_t len,
+                        uint32_t *plainLen)
 {
     struct AES_ctx ctx;
-
     uint8_t local_iv[16];
 
     memcpy(local_iv, iv, 16);
@@ -101,48 +149,65 @@ void decryptPayload(uint8_t *data,
     AES_CBC_decrypt_buffer(&ctx,
                            data,
                            len);
+
+    uint32_t unpaddedLen = pkcs7_unpad(data, len);
+    if (plainLen != NULL)
+    {
+        *plainLen = unpaddedLen;
+    }
+
+    return unpaddedLen;
 }
 
 /* ================= MAIN ================= */
 
 int main(void)
 {
-    uint8_t payload[16] =
+    uint8_t payload[32] =
     {
         'D','R','O','N',
         'E','_','D','A',
-        'T','A','_','2',
-        '5','6','!','!'
+        'T','A','_','2','5'
     };
 
     uint32_t crc_before;
     uint32_t crc_after;
+    uint32_t plainLen = 13;
+    uint32_t cipherLen;
+    uint32_t decryptedLen;
 
     printf("Original Data:\n");
-    printArray(payload, 16);
+    printArray(payload, plainLen);
 
-    crc_before = crc32(payload, 16);
+    crc_before = crc32(payload, plainLen);
 
     printf("\nCRC Before = %08X\n",
            crc_before);
 
-    encryptPayload(payload, 16);
+    cipherLen = encryptPayload(payload, plainLen, sizeof(payload));
+    if (cipherLen == 0)
+    {
+        printf("Failed to pad and encrypt data\n");
+        return 1;
+    }
 
-    printf("\nEncrypted Data:\n");
-    printArray(payload, 16);
+    printf("\nEncrypted Data (%u bytes):\n", cipherLen);
+    printArray(payload, cipherLen);
 
     /* Uncomment to test CRC failure */
+    /* payload[5] ^= 0x01; */
 
-    /*
-    payload[5] ^= 0x01;
-    */
+    decryptedLen = decryptPayload(payload, cipherLen, &plainLen);
+    if (decryptedLen == 0)
+    {
+        printf("Failed to decrypt or unpad data\n");
+        return 1;
+    }
 
-    decryptPayload(payload, 16);
+    printf("\nDecrypted Data (%u bytes):\n", decryptedLen);
+    printArray(payload, decryptedLen);
 
-    printf("\nDecrypted Data:\n");
-    printArray(payload, 16);
-
-    crc_after = crc32(payload, 16);
+    crc_after = crc32(payload, decryptedLen);
 
     printf("\nCRC After = %08X\n",
            crc_after);
