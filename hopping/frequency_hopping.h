@@ -47,6 +47,39 @@ typedef struct
 } FH_HandleTypeDef;
 
 /***************************
+ * E220 DRIVER PROTOTYPES
+ ***************************/
+
+/**
+ * Initialize the E220 module UART transport and prepare the module for use.
+ * @return: 0 = success, -1 = error
+ */
+int32_t E220_Init(void);
+
+/**
+ * Apply a new channel through the E220 UART configuration protocol.
+ * @param channel: Channel number to write to the module.
+ * @return: 0 = success, -1 = error
+ */
+int32_t E220_SetChannel(uint8_t channel);
+
+/**
+ * Transmit user payload bytes through the E220 UART transport.
+ * @param data: Payload bytes to send.
+ * @param length: Payload length in bytes.
+ * @return: 0 = success, -1 = error
+ */
+int32_t E220_Send(const uint8_t *data, uint16_t length);
+
+/**
+ * Receive a payload from the E220 UART transport.
+ * @param data: Output buffer for received bytes.
+ * @param length: Pointer to the received payload length.
+ * @return: 0 = success, -1 = error
+ */
+int32_t E220_Receive(uint8_t *data, uint16_t *length);
+
+/***************************
  * FUNCTION DECLARATIONS
  ***************************/
 

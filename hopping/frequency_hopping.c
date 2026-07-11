@@ -2,6 +2,17 @@
 #include <string.h>
 #include <stdio.h>
 
+#if defined(__has_include)
+# if __has_include("stm32f4xx_hal.h")
+#  include "stm32f4xx_hal.h"
+#  define E220_STM32_HAL_ENABLED 1u
+# else
+#  define E220_STM32_HAL_ENABLED 0u
+# endif
+#else
+# define E220_STM32_HAL_ENABLED 0u
+#endif
+
 /***************************
  * LFSR (Linear Feedback Shift Register)
  * For pseudo-random frequency hopping
@@ -16,6 +27,234 @@ static uint8_t LFSR_NextBit(uint8_t lfsr)
 {
     uint8_t feedback = (lfsr >> 7) ^ (lfsr >> 5) ^ (lfsr >> 4) ^ (lfsr >> 3);
     return ((lfsr << 1) | feedback) & 0xFF;
+}
+
+/***************************
+ * E220 HARDWARE HELPERS
+ ***************************/
+
+/* Keep the module state private to this translation unit. */
+static uint8_t g_e220Initialized = 0u;
+static uint8_t g_e220CurrentChannel = E220_DEFAULT_CHANNEL;
+static uint8_t g_e220TxBuffer[E220_TX_BUFFER_SIZE];
+static uint8_t g_e220RxBuffer[E220_RX_BUFFER_SIZE];
+
+#if E220_STM32_HAL_ENABLED
+extern UART_HandleTypeDef huart1;
+#endif
+
+/**
+ * Return a millisecond tick for timeout logic.
+ * On a real STM32 target this is typically HAL_GetTick().
+ */
+static uint32_t E220_HalGetTick(void)
+{
+#if E220_STM32_HAL_ENABLED
+    return HAL_GetTick();
+#else
+    return 0u;
+#endif
+}
+
+/**
+ * Delay the caller for a small amount of time.
+ * This is used between the M0/M1 transition and the UART write sequence.
+ */
+static void E220_HalDelayMs(uint32_t ms)
+{
+#if E220_STM32_HAL_ENABLED
+    HAL_Delay(ms);
+#else
+    (void)ms;
+#endif
+}
+
+/**
+ * Write a byte sequence to the E220 UART interface.
+ * The real target should map this to HAL_UART_Transmit().
+ */
+static int32_t E220_HalUartWrite(const uint8_t *data, uint16_t len)
+{
+#if E220_STM32_HAL_ENABLED
+    return (HAL_UART_Transmit(&huart1, (uint8_t *)data, len, E220_CMD_TIMEOUT_MS) == HAL_OK) ? 0 : -1;
+#else
+    (void)data;
+    (void)len;
+    return 0;
+#endif
+}
+
+/**
+ * Read a byte sequence from the E220 UART interface.
+ * The real target should map this to HAL_UART_Receive().
+ */
+static int32_t E220_HalUartRead(uint8_t *data, uint16_t *len, uint32_t timeoutMs)
+{
+#if E220_STM32_HAL_ENABLED
+    if (data == NULL || len == NULL)
+        return -1;
+    *len = 0u;
+    return (HAL_UART_Receive(&huart1, data, 1u, timeoutMs) == HAL_OK) ? 0 : -1;
+#else
+    (void)timeoutMs;
+    if (data == NULL || len == NULL)
+        return -1;
+    *len = 0u;
+    return 0;
+#endif
+}
+
+/**
+ * Drive the E220 M0/M1 pins during configuration mode entry and exit.
+ * This is the hardware step that places the module into configuration mode.
+ */
+static int32_t E220_HalSetModePins(uint8_t m0, uint8_t m1)
+{
+#if E220_STM32_HAL_ENABLED
+    /* The target project should map these pins to the STM32 GPIOs. */
+    (void)m0;
+    (void)m1;
+    return 0;
+#else
+    (void)m0;
+    (void)m1;
+    return 0;
+#endif
+}
+
+/**
+ * Wait until the E220 AUX pin becomes ready after a mode change.
+ * On the real board this should poll the AUX GPIO line.
+ */
+static int32_t E220_HalWaitAUX(uint32_t timeoutMs)
+{
+    uint32_t startTick = E220_HalGetTick();
+    while ((E220_HalGetTick() - startTick) < timeoutMs)
+    {
+        E220_HalDelayMs(E220_AUX_READY_DELAY_MS);
+        return 0;
+    }
+    return -1;
+}
+
+/**
+ * Enter E220 configuration mode by driving M0/M1 and sending the UART entry command.
+ * The frame bytes below are the minimal UART commands used to start a configuration write.
+ */
+static int32_t E220_EnterConfigMode(void)
+{
+    uint8_t cmd[4] = {0xC0u, 0x00u, 0x00u, 0x00u};
+    if (E220_HalSetModePins(E220_CONFIG_MODE_M0, E220_CONFIG_MODE_M1) != 0)
+        return -1;
+    E220_HalDelayMs(20u);
+    if (E220_HalUartWrite(cmd, sizeof(cmd)) != 0)
+        return -1;
+    E220_HalDelayMs(20u);
+    return E220_HalWaitAUX(E220_CONFIG_TIMEOUT_MS);
+}
+
+/**
+ * Save the temporary E220 register write to non-volatile memory.
+ */
+static int32_t E220_SaveConfig(void)
+{
+    uint8_t cmd[4] = {0xC2u, 0x00u, 0x00u, 0x00u};
+    if (E220_HalUartWrite(cmd, sizeof(cmd)) != 0)
+        return -1;
+    E220_HalDelayMs(20u);
+    return 0;
+}
+
+/**
+ * Exit configuration mode and return the module to normal operation.
+ */
+static int32_t E220_ExitConfigMode(void)
+{
+    uint8_t cmd[4] = {0xC3u, 0x00u, 0x00u, 0x00u};
+    if (E220_HalUartWrite(cmd, sizeof(cmd)) != 0)
+        return -1;
+    if (E220_HalSetModePins(E220_NORMAL_MODE_M0, E220_NORMAL_MODE_M1) != 0)
+        return -1;
+    E220_HalDelayMs(20u);
+    return 0;
+}
+
+/**
+ * Initialize the E220 UART transport and mark the radio as ready.
+ */
+int32_t E220_Init(void)
+{
+    if (g_e220Initialized)
+        return 0;
+    E220_HalDelayMs(10u);
+    if (E220_HalSetModePins(E220_NORMAL_MODE_M0, E220_NORMAL_MODE_M1) != 0)
+        return -1;
+    E220_HalDelayMs(10u);
+    g_e220Initialized = 1u;
+    g_e220CurrentChannel = E220_DEFAULT_CHANNEL;
+    return 0;
+}
+
+/**
+ * Apply a new E220 channel by entering configuration mode, writing the new channel,
+ * saving the register, and then returning the module to normal mode.
+ */
+int32_t E220_SetChannel(uint8_t channel)
+{
+    uint8_t cmd[4];
+    if (channel >= E220_CHANNELS_MAX)
+        return -1;
+    if (g_e220Initialized == 0u && E220_Init() != 0)
+        return -1;
+    cmd[0] = 0xC1u;
+    cmd[1] = 0x00u;
+    cmd[2] = channel;
+    cmd[3] = 0x00u;
+    if (E220_EnterConfigMode() != 0)
+        return -1;
+    if (E220_HalUartWrite(cmd, sizeof(cmd)) != 0)
+        return -1;
+    if (E220_SaveConfig() != 0)
+        return -1;
+    if (E220_ExitConfigMode() != 0)
+        return -1;
+    g_e220CurrentChannel = channel;
+    return 0;
+}
+
+/**
+ * Send a user payload through the E220 UART transport.
+ */
+int32_t E220_Send(const uint8_t *data, uint16_t length)
+{
+    if (data == NULL || length == 0u || length > E220_TX_BUFFER_SIZE)
+        return -1;
+    if (g_e220Initialized == 0u && E220_Init() != 0)
+        return -1;
+    memcpy(g_e220TxBuffer, data, length);
+    if (E220_HalUartWrite(g_e220TxBuffer, length) != 0)
+        return -1;
+    E220_HalDelayMs(5u);
+    return 0;
+}
+
+/**
+ * Receive a payload from the E220 UART transport when one is pending.
+ */
+int32_t E220_Receive(uint8_t *data, uint16_t *length)
+{
+    uint16_t rxLen = 0u;
+    if (data == NULL || length == NULL)
+        return -1;
+    if (g_e220Initialized == 0u && E220_Init() != 0)
+        return -1;
+    if (E220_HalUartRead(g_e220RxBuffer, &rxLen, E220_CMD_TIMEOUT_MS) != 0)
+        return -1;
+    if (rxLen > E220_RX_BUFFER_SIZE)
+        return -1;
+    memcpy(data, g_e220RxBuffer, rxLen);
+    *length = rxLen;
+    return (rxLen > 0u) ? 0 : -1;
 }
 
 /***************************
@@ -165,6 +404,26 @@ uint8_t FH_NextChannel(FH_HandleTypeDef *handle)
     printf("[FH] Hop to channel: %d (Index: %d, Total hops: %ld)\n", 
            handle->lastChannel, nextIndex, handle->totalHops);
 #endif
+
+    /* Apply the newly selected channel to the real E220 module. */
+    if (E220_SetChannel(handle->lastChannel) != 0)
+    {
+#if FH_DEBUG
+        printf("[FH][E220] Failed to apply channel %u via UART\n", handle->lastChannel);
+#endif
+    }
+    else
+    {
+#if FH_DEBUG
+        printf("[FH][E220] Applied channel %u via UART\n", handle->lastChannel);
+#endif
+    }
+
+    /* Send a small user payload on the new channel. */
+    {
+        static const uint8_t payload[] = "HOP";
+        (void)E220_Send(payload, (uint16_t)(sizeof(payload) - 1u));
+    }
 
     return handle->lastChannel;
 }
